@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>N-able Service Status</title>
+<!--
+  N-able status widget for SharePoint.
+  Data: https://uptime.n-able.com/api/v1/public/dashboard/  (public, CORS-enabled, no key)
+  Status codes (from N-able's own dashboard code):
+    0 = Operational, 1 = Maintenance, 2 = Incident, 3 = Incident + Maintenance
+
+  Optional URL parameters (use them in the Embed web part URL):
+    ?region=Americas            only show one region (Americas, Europe, APAC, Global is always kept)
+    &services=N-central,Cove    only show products whose name contains any of these words
+    &refresh=5                  minutes between refreshes (default 5, minimum 1)
+    &issuesOnly=1               hide operational products, show "all clear" when nothing is wrong
+-->
+<style>
+  :root {
+    --bg: #ffffff; --fg: #242424; --muted: #616161; --line: #e0e0e0; --row: #fafafa;
+    --ok: #107c10; --ok-bg: #dff6dd;
+    --maint: #0f6cbd; --maint-bg: #e5f1fb;
+    --bad: #c50f1f; --bad-bg: #fde7e9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #1f1f1f; --fg: #f0f0f0; --muted: #adadad; --line: #3d3d3d; --row: #262626;
+      --ok: #54b054; --ok-bg: #0f2e0f; --maint: #4aa0e6; --maint-bg: #0c2a43;
+      --bad: #f1707b; --bad-bg: #3f1013;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.4 "Segoe UI", "Segoe UI Web (West European)", -apple-system, Roboto, sans-serif; }
+  .wrap { padding: 12px 16px; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+  h1 { font-size: 16px; font-weight: 600; margin: 0; }
+  .meta { color: var(--muted); font-size: 12px; }
+  .meta a { color: inherit; }
+  .banner { margin: 10px 0; padding: 10px 12px; border-radius: 4px; font-weight: 600; display: flex; gap: 8px; align-items: center; }
+  .banner.ok { background: var(--ok-bg); color: var(--ok); }
+  .banner.maint { background: var(--maint-bg); color: var(--maint); }
+  .banner.bad { background: var(--bad-bg); color: var(--bad); }
+  ul { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); }
+  li { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
+       padding: 7px 4px; border-bottom: 1px solid var(--line); }
+  li.issue { background: var(--row); }
+  .name { min-width: 0; overflow-wrap: anywhere; }
+  .pills { display: flex; gap: 4px; flex-wrap: wrap; }
+  .pill { font-size: 12px; padding: 1px 8px; border-radius: 10px; white-space: nowrap; }
+  .pill.s0 { background: var(--ok-bg); color: var(--ok); }
+  .pill.s1 { background: var(--maint-bg); color: var(--maint); }
+  .pill.s2, .pill.s3 { background: var(--bad-bg); color: var(--bad); font-weight: 600; }
+  .err { color: var(--bad); }
+  button { font: inherit; font-size: 12px; background: none; border: 1px solid var(--line); color: var(--fg);
+           border-radius: 4px; padding: 2px 8px; cursor: pointer; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>N-able Service Status</h1>
+    <span class="meta"><span id="updated">Loading…</span> · <button id="reload" type="button">Refresh</button></span>
+  </header>
+  <div id="banner" class="banner" hidden></div>
+  <ul id="list"></ul>
+  <p class="meta">Source: <a href="https://uptime.n-able.com/" target="_blank" rel="noopener">uptime.n-able.com</a></p>
+</div>
+<script>
+(function () {
+  var API = "https://uptime.n-able.com/api/v1/public/dashboard/";
+  var LABEL = { 0: "Operational", 1: "Maintenance", 2: "Incident", 3: "Incident + Maintenance" };
+  var RANK  = { 2: 3, 3: 3, 1: 2, 0: 1 };          // worst first when sorting
+  var REGION_ORDER = ["Global", "Americas", "Europe", "APAC"];
+
+  var q = new URLSearchParams(location.search);
+  var region = (q.get("region") || "").trim();
+  var words = (q.get("services") || "").split(",").map(function (s) { return s.trim().toLowerCase(); }).filter(Boolean);
+  var refreshMin = Math.max(1, parseFloat(q.get("refresh")) || 5);
+  var issuesOnly = q.get("issuesOnly") === "1";
+
+  var listEl = document.getElementById("list");
+  var bannerEl = document.getElementById("banner");
+  var updatedEl = document.getElementById("updated");
+
+  function productName(svc) {
+    // "N-central (hosted version) (Americas)" -> "N-central (hosted version)"
+    var suffix = " (" + svc.group + ")";
+    return svc.name.slice(-suffix.length) === suffix ? svc.name.slice(0, -suffix.length) : svc.name;
+  }
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+
+  function fetchAll(url, acc) {
+    return fetch(url, { cache: "no-store" }).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    }).then(function (data) {
+      acc = acc.concat(data.objects || []);
+      var next = data.meta && data.meta.next;
+      return next ? fetchAll(new URL(next, API).href, acc) : acc;
+    });
+  }
+
+  function render(services) {
+    services = services.filter(function (s) {
+      if (region && s.group !== region && s.group !== "Global") return false;
+      if (words.length) {
+        var n = s.name.toLowerCase();
+        return words.some(function (w) { return n.indexOf(w) !== -1; });
+      }
+      return true;
+    });
+
+    // Group regional entries under one product row
+    var products = {};
+    services.forEach(function (s) {
+      var key = productName(s);
+      (products[key] = products[key] || []).push(s);
+    });
+    var rows = Object.keys(products).map(function (name) {
+      var regs = products[name].sort(function (a, b) {
+        return REGION_ORDER.indexOf(a.group) - REGION_ORDER.indexOf(b.group);
+      });
+      var worst = regs.reduce(function (m, s) { return RANK[s.status] > RANK[m] ? s.status : m; }, 0);
+      return { name: name, regs: regs, worst: worst };
+    }).sort(function (a, b) {
+      return (RANK[b.worst] - RANK[a.worst]) || a.name.localeCompare(b.name);
+    });
+
+    var incidents = rows.filter(function (r) { return r.worst >= 2; }).length;
+    var maint = rows.filter(function (r) { return r.worst === 1; }).length;
+    bannerEl.hidden = false;
+    if (incidents) {
+      bannerEl.className = "banner bad";
+      bannerEl.textContent = "⚠ " + incidents + " product" + (incidents > 1 ? "s" : "") + " reporting an incident" +
+        (maint ? ", " + maint + " in maintenance" : "");
+    } else if (maint) {
+      bannerEl.className = "banner maint";
+      bannerEl.textContent = "🔧 " + maint + " product" + (maint > 1 ? "s" : "") + " in scheduled maintenance";
+    } else {
+      bannerEl.className = "banner ok";
+      bannerEl.textContent = "✓ All N-able systems operational";
+    }
+
+    listEl.textContent = "";
+    rows.forEach(function (r) {
+      if (issuesOnly && r.worst === 0) return;
+      var li = el("li", r.worst ? "issue" : "");
+      li.appendChild(el("span", "name", r.name));
+      var pills = el("span", "pills");
+      r.regs.forEach(function (s) {
+        var text = (r.regs.length > 1 || s.group !== "Global") && !region ? s.group + ": " + LABEL[s.status] : LABEL[s.status];
+        var p = el("span", "pill s" + s.status, text || "Unknown");
+        p.title = s.name + " — " + (LABEL[s.status] || "Unknown status " + s.status);
+        pills.appendChild(p);
+      });
+      li.appendChild(pills);
+      listEl.appendChild(li);
+    });
+    if (!listEl.children.length && !issuesOnly) listEl.appendChild(el("li", "", "No services match the filter."));
+
+    updatedEl.textContent = "Updated " + new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  }
+
+  function load() {
+    updatedEl.textContent = "Loading…";
+    fetchAll(API, []).then(render).catch(function (e) {
+      updatedEl.textContent = "";
+      bannerEl.hidden = false;
+      bannerEl.className = "banner bad";
+      bannerEl.textContent = "Couldn't reach uptime.n-able.com (" + e.message + "). Check the status page directly.";
+    });
+  }
+
+  document.getElementById("reload").addEventListener("click", load);
+  load();
+  setInterval(load, refreshMin * 60000);
+})();
+</script>
+</body>
+</html>

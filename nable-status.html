@@ -3,55 +3,76 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src https://*.workers.dev http://localhost:* http://127.0.0.1:*; base-uri 'none'; form-action 'none'">
 <title>N-able Service Status</title>
 <!--
   N-able status widget for SharePoint.
-  Data: https://uptime.n-able.com/api/v1/public/dashboard/  (public, CORS-enabled, no key)
-  Status codes (from N-able's own dashboard code):
-    0 = Operational, 1 = Maintenance, 2 = Incident, 3 = Incident + Maintenance
+
+  Data: the Cloudflare Worker relay in cloudflare-worker.js. The Worker fetches N-able's status
+  (services + incident/maintenance posts) and returns plain-text JSON, so viewers' browsers never
+  contact uptime.n-able.com. Everything is shown as text; nothing from N-able is run as HTML or code.
+
+  >>> Set DATA_URL below to your Worker's address. <<<
 
   Optional URL parameters (use them in the Embed web part URL):
-    ?region=Americas            only show one region (Americas, Europe, APAC, Global is always kept)
+    ?region=Americas            only show one region (Americas, Europe, APAC); Global is always kept
     &services=N-central,Cove    only show products whose name contains any of these words
-    &refresh=5                  minutes between refreshes (default 5, minimum 1)
-    &issuesOnly=1               hide operational products, show "all clear" when nothing is wrong
+    &issuesOnly=1               hide operational products in the service list
+    &events=0                   hide the incident / maintenance posts
+    &refresh=1                  minutes between refreshes (default 1, minimum 0.5)
 -->
 <style>
   :root {
-    --bg: #ffffff; --fg: #242424; --muted: #616161; --line: #e0e0e0; --row: #fafafa;
+    --bg: #ffffff; --fg: #242424; --muted: #616161; --line: #e0e0e0; --row: #fafafa; --card: #ffffff;
     --ok: #107c10; --ok-bg: #dff6dd;
     --maint: #0f6cbd; --maint-bg: #e5f1fb;
+    --warn: #8a5300; --warn-bg: #fff4ce;
     --bad: #c50f1f; --bad-bg: #fde7e9;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
-      --bg: #1f1f1f; --fg: #f0f0f0; --muted: #adadad; --line: #3d3d3d; --row: #262626;
+      --bg: #1f1f1f; --fg: #f0f0f0; --muted: #adadad; --line: #3d3d3d; --row: #262626; --card: #242424;
       --ok: #54b054; --ok-bg: #0f2e0f; --maint: #4aa0e6; --maint-bg: #0c2a43;
-      --bad: #f1707b; --bad-bg: #3f1013;
+      --warn: #f2c661; --warn-bg: #3a2c05; --bad: #f1707b; --bad-bg: #3f1013;
     }
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg);
-         font: 14px/1.4 "Segoe UI", "Segoe UI Web (West European)", -apple-system, Roboto, sans-serif; }
+         font: 14px/1.45 "Segoe UI", "Segoe UI Web (West European)", -apple-system, Roboto, sans-serif; }
   .wrap { padding: 12px 16px; }
   header { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
   h1 { font-size: 16px; font-weight: 600; margin: 0; }
+  h2 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); margin: 16px 0 6px; }
   .meta { color: var(--muted); font-size: 12px; }
-  .meta a { color: inherit; }
-  .banner { margin: 10px 0; padding: 10px 12px; border-radius: 4px; font-weight: 600; display: flex; gap: 8px; align-items: center; }
+  .banner { margin: 10px 0; padding: 10px 12px; border-radius: 4px; font-weight: 600; }
   .banner.ok { background: var(--ok-bg); color: var(--ok); }
   .banner.maint { background: var(--maint-bg); color: var(--maint); }
+  .banner.warn { background: var(--warn-bg); color: var(--warn); }
   .banner.bad { background: var(--bad-bg); color: var(--bad); }
-  ul { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); }
-  li { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
+  ul.svc { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); }
+  ul.svc li { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
        padding: 7px 4px; border-bottom: 1px solid var(--line); }
-  li.issue { background: var(--row); }
+  ul.svc li.issue { background: var(--row); }
   .name { min-width: 0; overflow-wrap: anywhere; }
   .pills { display: flex; gap: 4px; flex-wrap: wrap; }
   .pill { font-size: 12px; padding: 1px 8px; border-radius: 10px; white-space: nowrap; }
-  .pill.s0 { background: var(--ok-bg); color: var(--ok); }
-  .pill.s1 { background: var(--maint-bg); color: var(--maint); }
-  .pill.s2, .pill.s3 { background: var(--bad-bg); color: var(--bad); font-weight: 600; }
+  .s0 { background: var(--ok-bg); color: var(--ok); }
+  .s1, .k-maintenance, .k-planned { background: var(--maint-bg); color: var(--maint); }
+  .s2, .s3, .k-incident { background: var(--bad-bg); color: var(--bad); font-weight: 600; }
+  .neutral { background: var(--row); color: var(--muted); border: 1px solid var(--line); }
+  .event { border: 1px solid var(--line); border-left: 4px solid var(--maint); border-radius: 4px; background: var(--card);
+           padding: 10px 12px; margin-bottom: 10px; }
+  .event.incident { border-left-color: var(--bad); }
+  .event .title { font-weight: 600; margin: 6px 0 2px; overflow-wrap: anywhere; }
+  .event .when { color: var(--muted); font-size: 12px; }
+  .event .affected { margin-top: 6px; }
+  .timeline { margin: 8px 0 0; padding: 0; list-style: none; border-left: 2px solid var(--line); }
+  .timeline li { padding: 0 0 6px 10px; }
+  .timeline .t { color: var(--muted); font-size: 12px; }
+  details { margin-top: 8px; }
+  summary { cursor: pointer; color: var(--maint); font-size: 13px; }
+  .post { margin-top: 6px; overflow-wrap: anywhere; }
+  .post p { margin: 0 0 8px; }
   .err { color: var(--bad); }
   button { font: inherit; font-size: 12px; background: none; border: 1px solid var(--line); color: var(--fg);
            border-radius: 4px; padding: 2px 8px; cursor: pointer; }
@@ -64,31 +85,34 @@
     <span class="meta"><span id="updated">Loading…</span> · <button id="reload" type="button">Refresh</button></span>
   </header>
   <div id="banner" class="banner" hidden></div>
-  <ul id="list"></ul>
-  <p class="meta">Source: <a href="https://uptime.n-able.com/" target="_blank" rel="noopener">uptime.n-able.com</a></p>
+  <div id="events"></div>
+  <h2 id="svcHead" hidden>Services</h2>
+  <ul id="list" class="svc"></ul>
+  <p class="meta">Source: N-able public status page, relayed. Times shown in your local time zone.</p>
 </div>
 <script>
 (function () {
-  var API = "https://uptime.n-able.com/api/v1/public/dashboard/";
+  // Your Cloudflare Worker address:
+  var DATA_URL = "https://nable-status.robert-lewis-e15.workers.dev/status.json";
+
+  var STALE_MIN = 5;
   var LABEL = { 0: "Operational", 1: "Maintenance", 2: "Incident", 3: "Incident + Maintenance" };
-  var RANK  = { 2: 3, 3: 3, 1: 2, 0: 1 };          // worst first when sorting
-  var REGION_ORDER = ["Global", "Americas", "Europe", "APAC"];
+  var RANK  = { 2: 3, 3: 3, 1: 2, 0: 1 };
+  var GROUPS = ["Global", "Americas", "Europe", "APAC"];
+  var KIND_LABEL = { incident: "Incident", maintenance: "Maintenance", planned: "Planned maintenance" };
 
   var q = new URLSearchParams(location.search);
+  // Local testing only: allow ?data= to point at a test file when served from localhost.
+  if (/^(localhost|127\.0\.0\.1)$/.test(location.hostname) && q.get("data")) DATA_URL = q.get("data");
   var region = (q.get("region") || "").trim();
   var words = (q.get("services") || "").split(",").map(function (s) { return s.trim().toLowerCase(); }).filter(Boolean);
-  var refreshMin = Math.max(1, parseFloat(q.get("refresh")) || 5);
+  var refreshMin = Math.max(0.5, parseFloat(q.get("refresh")) || 1);
   var issuesOnly = q.get("issuesOnly") === "1";
+  var showEvents = q.get("events") !== "0";
 
-  var listEl = document.getElementById("list");
-  var bannerEl = document.getElementById("banner");
-  var updatedEl = document.getElementById("updated");
-
-  function productName(svc) {
-    // "N-central (hosted version) (Americas)" -> "N-central (hosted version)"
-    var suffix = " (" + svc.group + ")";
-    return svc.name.slice(-suffix.length) === suffix ? svc.name.slice(0, -suffix.length) : svc.name;
-  }
+  var $ = function (id) { return document.getElementById(id); };
+  var listEl = $("list"), bannerEl = $("banner"), updatedEl = $("updated"), eventsEl = $("events"), svcHead = $("svcHead");
+  var openState = {};   // remembers which posts the viewer expanded, across refreshes
 
   function el(tag, cls, text) {
     var e = document.createElement(tag);
@@ -97,42 +121,191 @@
     return e;
   }
 
-  function fetchAll(url, acc) {
-    return fetch(url, { cache: "no-store" }).then(function (r) {
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      return r.json();
-    }).then(function (data) {
-      acc = acc.concat(data.objects || []);
-      var next = data.meta && data.meta.next;
-      return next ? fetchAll(new URL(next, API).href, acc) : acc;
+  // "N-central (hosted version) (Americas)" -> { product: "N-central (hosted version)", group: "Americas" }
+  function split(name) {
+    var m = /^(.*) \((Americas|Europe|APAC|Global)\)$/.exec(name);
+    return m ? { product: m[1], group: m[2] } : { product: name, group: "Global" };
+  }
+
+  function nameMatches(name) {
+    var g = split(name).group;
+    if (region && g !== region && g !== "Global") return false;
+    if (words.length) {
+      var n = name.toLowerCase();
+      return words.some(function (w) { return n.indexOf(w) !== -1; });
+    }
+    return true;
+  }
+
+  function fmt(iso) {
+    var d = new Date(iso);
+    return isNaN(d) ? "" : d.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  }
+  function ago(iso) {
+    var m = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+    if (isNaN(m)) return "";
+    var future = m < 0; m = Math.abs(m);
+    var s = m < 60 ? m + "m" : m < 2880 ? Math.floor(m / 60) + "h " + (m % 60) + "m" : Math.round(m / 1440) + " days";
+    return future ? "in " + s : s + " ago";
+  }
+
+  // Render N-able's light Markdown (**bold**, *italic*, [text](https://link), "* " bullets)
+  // as safe DOM nodes. Never uses innerHTML; only https links become clickable, and each shows its site name.
+  var LINK = /\[([^\]]+)\]\((https:\/\/[^\s)]+)\)/g;
+  function inline(parent, text) {
+    var last = 0, m;
+    LINK.lastIndex = 0;
+    while ((m = LINK.exec(text))) {
+      addText(parent, text.slice(last, m.index));
+      var host = "";
+      try { host = new URL(m[2]).hostname; } catch (_) {}
+      if (host) {
+        var a = el("a", "", m[1].replace(/\*/g, ""));
+        a.href = m[2]; a.target = "_blank"; a.rel = "noopener noreferrer";
+        parent.appendChild(a);
+        parent.appendChild(el("span", "meta", " (" + host + ")"));
+      } else addText(parent, m[1]);
+      last = LINK.lastIndex;
+    }
+    addText(parent, text.slice(last));
+  }
+  function addText(parent, s) {
+    s = s.replace(/\*/g, "");
+    if (s) parent.appendChild(document.createTextNode(s));
+  }
+  function richLine(parent, line) {
+    line = line.replace(/^\*\s+/, "• ");
+    line.split("**").forEach(function (part, i) {
+      if (!part) return;
+      if (i % 2) { var b = el("strong"); inline(b, part); parent.appendChild(b); }
+      else inline(parent, part);
+    });
+  }
+  function post(text) {
+    var box = el("div", "post");
+    text.split(/\n\s*\n/).forEach(function (para) {
+      para = para.trim();
+      if (!para) return;
+      var p = el("p");
+      para.split("\n").forEach(function (line, i) {
+        if (i) p.appendChild(document.createElement("br"));
+        richLine(p, line.trim());
+      });
+      box.appendChild(p);
+    });
+    return box;
+  }
+  function titleOf(desc) {
+    var lines = desc.split("\n").map(function (l) {
+      return l.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/\*/g, "").trim();
+    }).filter(Boolean);
+    // Skip a bare product-name first line like "N-able® N-Central" when a headline follows
+    if (lines.length > 1 && lines[0].length < 40 && !/[.:!]/.test(lines[0])) return lines[1];
+    return lines[0] || "(no description)";
+  }
+
+  function renderEvents(events) {
+    eventsEl.textContent = "";
+    if (!showEvents) return;
+    var order = { incident: 0, maintenance: 1, planned: 2 };
+    events = events.filter(function (e) {
+      return !e.services.length ? !region && !words.length : e.services.some(nameMatches);
+    }).sort(function (a, b) {
+      return (order[a.kind] - order[b.kind]) || (a.kind === "planned"
+        ? new Date(a.start) - new Date(b.start) : new Date(b.start) - new Date(a.start));
+    });
+    var lastKind = null;
+    var heads = { incident: "Active incidents", maintenance: "Maintenance in progress", planned: "Upcoming maintenance" };
+    events.forEach(function (e) {
+      if (e.kind !== lastKind) { eventsEl.appendChild(el("h2", "", heads[e.kind])); lastKind = e.kind; }
+      var card = el("div", "event " + e.kind);
+      var tags = el("div", "pills");
+      tags.appendChild(el("span", "pill k-" + e.kind, KIND_LABEL[e.kind]));
+      if (e.status) tags.appendChild(el("span", "pill neutral", e.status));
+      if (e.severity) tags.appendChild(el("span", "pill neutral", e.severity));
+      card.appendChild(tags);
+      card.appendChild(el("div", "title", titleOf(e.description)));
+      var when = e.kind === "planned"
+        ? "Scheduled " + fmt(e.start) + (e.end ? " – " + fmt(e.end) : "") + " (" + ago(e.start) + ")"
+        : "Started " + fmt(e.start) + " (" + ago(e.start) + ")" + (e.end ? " · expected end " + fmt(e.end) : "");
+      card.appendChild(el("div", "when", when));
+
+      var prods = [];
+      e.services.filter(nameMatches).forEach(function (s) {
+        var p = split(s).product; if (prods.indexOf(p) === -1) prods.push(p);
+      });
+      if (prods.length) {
+        var aff = el("div", "pills affected");
+        prods.forEach(function (p) { aff.appendChild(el("span", "pill neutral", p)); });
+        card.appendChild(aff);
+      }
+
+      var ups = e.updates.filter(function (u) { return u.update && u.update.trim(); })
+        .sort(function (a, b) { return new Date(b.date) - new Date(a.date); });
+      if (ups.length) {
+        var tl = el("ul", "timeline");
+        ups.forEach(function (u) {
+          var li = el("li");
+          li.appendChild(el("div", "t", fmt(u.date) + (u.status ? " · " + u.status : "")));
+          li.appendChild(post(u.update));
+          tl.appendChild(li);
+        });
+        card.appendChild(tl);
+      }
+
+      if (e.description) {
+        var det = el("details");
+        var key = e.kind + e.id;
+        det.open = key in openState ? openState[key] : e.kind === "incident";
+        det.addEventListener("toggle", function () { openState[key] = det.open; });
+        det.appendChild(el("summary", "", "Full post from N-able"));
+        det.appendChild(post(e.description));
+        card.appendChild(det);
+      }
+      eventsEl.appendChild(card);
     });
   }
 
-  function render(services) {
-    services = services.filter(function (s) {
-      if (region && s.group !== region && s.group !== "Global") return false;
-      if (words.length) {
-        var n = s.name.toLowerCase();
-        return words.some(function (w) { return n.indexOf(w) !== -1; });
-      }
-      return true;
-    });
-
-    // Group regional entries under one product row
+  function renderServices(services) {
     var products = {};
-    services.forEach(function (s) {
-      var key = productName(s);
+    services.filter(function (s) { return nameMatches(s.name); }).forEach(function (s) {
+      var key = split(s.name).product;
       (products[key] = products[key] || []).push(s);
     });
     var rows = Object.keys(products).map(function (name) {
-      var regs = products[name].sort(function (a, b) {
-        return REGION_ORDER.indexOf(a.group) - REGION_ORDER.indexOf(b.group);
-      });
+      var regs = products[name].sort(function (a, b) { return GROUPS.indexOf(a.group) - GROUPS.indexOf(b.group); });
       var worst = regs.reduce(function (m, s) { return RANK[s.status] > RANK[m] ? s.status : m; }, 0);
       return { name: name, regs: regs, worst: worst };
-    }).sort(function (a, b) {
-      return (RANK[b.worst] - RANK[a.worst]) || a.name.localeCompare(b.name);
+    }).sort(function (a, b) { return (RANK[b.worst] - RANK[a.worst]) || a.name.localeCompare(b.name); });
+
+    listEl.textContent = "";
+    rows.forEach(function (r) {
+      if (issuesOnly && r.worst === 0) return;
+      var li = el("li", r.worst ? "issue" : "");
+      li.appendChild(el("span", "name", r.name));
+      var pills = el("span", "pills");
+      r.regs.forEach(function (s) {
+        var lbl = LABEL[s.status] || "Unknown";
+        var p = el("span", "pill s" + s.status, !region && s.group !== "Global" ? s.group + ": " + lbl : lbl);
+        p.title = s.name + " — " + lbl;
+        pills.appendChild(p);
+      });
+      li.appendChild(pills);
+      listEl.appendChild(li);
     });
+    svcHead.hidden = !listEl.children.length;
+    return rows;
+  }
+
+  function render(data) {
+    var services = (data.services || []).filter(function (s) {
+      return s && typeof s.name === "string" && typeof s.group === "string" && typeof s.status === "number";
+    });
+    var events = (data.events || []).filter(function (e) {
+      return e && KIND_LABEL[e.kind] && Array.isArray(e.services) && Array.isArray(e.updates) && typeof e.description === "string";
+    });
+    var rows = renderServices(services);
+    renderEvents(events);
 
     var incidents = rows.filter(function (r) { return r.worst >= 2; }).length;
     var maint = rows.filter(function (r) { return r.worst === 1; }).length;
@@ -149,37 +322,34 @@
       bannerEl.textContent = "✓ All N-able systems operational";
     }
 
-    listEl.textContent = "";
-    rows.forEach(function (r) {
-      if (issuesOnly && r.worst === 0) return;
-      var li = el("li", r.worst ? "issue" : "");
-      li.appendChild(el("span", "name", r.name));
-      var pills = el("span", "pills");
-      r.regs.forEach(function (s) {
-        var text = (r.regs.length > 1 || s.group !== "Global") && !region ? s.group + ": " + LABEL[s.status] : LABEL[s.status];
-        var p = el("span", "pill s" + s.status, text || "Unknown");
-        p.title = s.name + " — " + (LABEL[s.status] || "Unknown status " + s.status);
-        pills.appendChild(p);
-      });
-      li.appendChild(pills);
-      listEl.appendChild(li);
-    });
-    if (!listEl.children.length && !issuesOnly) listEl.appendChild(el("li", "", "No services match the filter."));
-
-    updatedEl.textContent = "Updated " + new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    var fetched = new Date(data.fetched);
+    updatedEl.textContent = isNaN(fetched) ? "Checked: unknown" : "Checked " + fmt(data.fetched);
+    if (!isNaN(fetched) && (Date.now() - fetched.getTime()) / 60000 > STALE_MIN) {
+      bannerEl.className = "banner warn";
+      bannerEl.textContent = "⏱ Status data is " + ago(data.fetched).replace(" ago", "") + " old. Last known: " +
+        bannerEl.textContent.replace(/^[^ ]+ /, "");
+    }
   }
 
+  var busy = false;
   function load() {
+    if (busy) return;
+    busy = true;
     updatedEl.textContent = "Loading…";
-    fetchAll(API, []).then(render).catch(function (e) {
+    fetch(DATA_URL, { cache: "no-store" }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) {
+        if (!r.ok) throw new Error(j.error || "HTTP " + r.status);
+        return j;
+      });
+    }).then(render).catch(function (e) {
       updatedEl.textContent = "";
       bannerEl.hidden = false;
       bannerEl.className = "banner bad";
-      bannerEl.textContent = "Couldn't reach uptime.n-able.com (" + e.message + "). Check the status page directly.";
-    });
+      bannerEl.textContent = "Couldn't load status data: " + e.message;
+    }).then(function () { busy = false; });
   }
 
-  document.getElementById("reload").addEventListener("click", load);
+  $("reload").addEventListener("click", load);
   load();
   setInterval(load, refreshMin * 60000);
 })();
